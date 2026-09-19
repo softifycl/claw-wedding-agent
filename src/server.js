@@ -122,6 +122,19 @@ async function initPostgres() {
     `);
     // Migración idempotente: tabla ya existente sin password_hash
     await pg.query('ALTER TABLE cn_novios ADD COLUMN IF NOT EXISTS password_hash TEXT');
+    // Códigos de reseteo de contraseña del panel novios (15 min, un solo uso)
+    await pg.query(`
+      CREATE TABLE IF NOT EXISTS cn_reset_codigos (
+        id SERIAL PRIMARY KEY,
+        slug TEXT NOT NULL,
+        codigo_hash TEXT NOT NULL,
+        expira TIMESTAMPTZ NOT NULL,
+        intentos INT DEFAULT 0,
+        usado BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pg.query('CREATE INDEX IF NOT EXISTS cn_reset_codigos_slug_idx ON cn_reset_codigos (slug)');
     await pg.query(`
       CREATE TABLE IF NOT EXISTS cn_deseos (
         id SERIAL PRIMARY KEY,
@@ -2741,6 +2754,108 @@ app.post('/api/codigonovios/admin/login', cnLoginLimiter60, cnLoginLimiter15, cn
       return res.status(401).json({ error: 'Contraseña incorrecta' });
     }
     res.json({ ok: true, token: makeAdminToken(slug, CN_ADMIN_SECRET), slug });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Reseteo de contraseña del panel (código de 6 dígitos al email de la lista) ──
+const cnResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, limit: 5,
+  standardHeaders: 'draft-7', legacyHeaders: false,
+  keyGenerator: (req) => `${String((req.body && req.body.slug) || 'anon').toUpperCase().slice(0, 20)}:${req.ip}`,
+});
+
+function maskEmail(e) {
+  const s = String(e || '');
+  const i = s.indexOf('@');
+  if (i < 1) return '';
+  const u = s.slice(0, i), d = s.slice(i + 1);
+  return `${u.slice(0, 1)}${'*'.repeat(Math.max(2, Math.min(6, u.length - 1)))}@${d}`;
+}
+
+async function sendResetCodeEmail(to, codigo, nombreLista) {
+  const m = getMailer();
+  if (!m) throw new Error('mailer no configurado');
+  const subject = 'Tu código para recuperar la contraseña — Código Novios';
+  const text = [
+    `Hola${nombreLista ? ' ' + nombreLista : ''},`,
+    '',
+    `Tu código para cambiar la contraseña del panel de tu lista es: ${codigo}`,
+    '',
+    'El código vence en 15 minutos y sirve una sola vez.',
+    'Si no pediste este cambio, ignora este correo: tu contraseña sigue igual.',
+    '',
+    '— Código Novios',
+  ].join('\n');
+  const html = `
+    <div style="font-family:Georgia,'Times New Roman',serif;max-width:520px;margin:0 auto;color:#2b2b2b">
+      <h2 style="color:#8B3232;margin-bottom:6px">Recupera tu contraseña</h2>
+      <p>Hola${nombreLista ? ' ' + nombreLista : ''}, este es tu código para entrar al panel de tu lista:</p>
+      <p style="font-size:32px;letter-spacing:6px;font-weight:bold;color:#8B3232;margin:18px 0">${codigo}</p>
+      <p style="color:#555">Vence en <strong>15 minutos</strong> y sirve una sola vez.</p>
+      <p style="color:#999;font-size:12px">Si no pediste este cambio, ignora este correo: tu contraseña sigue igual.</p>
+      <p style="color:#999;font-size:12px;margin-top:18px">— Código Novios</p>
+    </div>`;
+  await m.sendMail({ from: CN_SMTP_FROM, to, replyTo: CN_SMTP_REPLY_TO, subject, text, html });
+}
+
+// POST /api/codigonovios/admin/reset-solicitar — envía un código de 6 dígitos (15 min)
+app.post('/api/codigonovios/admin/reset-solicitar', cnResetLimiter, async (req, res) => {
+  try {
+    const slug = ((req.body && req.body.slug) || '').toUpperCase().trim();
+    if (!slug) return res.status(400).json({ error: 'Ingresa el código de tu lista' });
+    if (!pg) return res.status(500).json({ error: 'Postgres no configurado' });
+    const r = await pg.query('SELECT email, nombre_novio, nombre_novia FROM cn_novios WHERE slug = $1', [slug]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Lista no encontrada' });
+    const n = r.rows[0];
+    if (!n.email) return res.status(400).json({ error: 'Esta lista no tiene email registrado. Escríbenos a novios@aconcaguacapital.cl y te ayudamos.' });
+    const codigo = String(crypto.randomInt(100000, 1000000));
+    await pg.query('UPDATE cn_reset_codigos SET usado = TRUE WHERE slug = $1 AND usado = FALSE', [slug]);
+    await pg.query(
+      "INSERT INTO cn_reset_codigos (slug, codigo_hash, expira) VALUES ($1, $2, NOW() + INTERVAL '15 minutes')",
+      [slug, hashPassword(codigo)]
+    );
+    const nombreLista = [n.nombre_novio, n.nombre_novia].filter(Boolean).join(' & ') || slug;
+    try {
+      await sendResetCodeEmail(n.email, codigo, nombreLista);
+    } catch (e) {
+      console.error('📧 reset code email error:', e.message);
+      return res.status(502).json({ error: 'No pudimos enviar el correo. Escríbenos a novios@aconcaguacapital.cl.' });
+    }
+    res.json({ ok: true, email: maskEmail(n.email), expira_min: 15 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/codigonovios/admin/reset-confirmar — valida el código y cambia la contraseña
+app.post('/api/codigonovios/admin/reset-confirmar', cnResetLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const slug = (b.slug || '').toUpperCase().trim();
+    const codigo = String(b.codigo || '').trim();
+    const nueva = String(b.password || '').trim();
+    if (!slug || !codigo) return res.status(400).json({ error: 'Faltan el código de lista o el código recibido' });
+    if (nueva.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
+    if (!pg) return res.status(500).json({ error: 'Postgres no configurado' });
+    const r = await pg.query(
+      'SELECT id, codigo_hash, intentos FROM cn_reset_codigos WHERE slug = $1 AND usado = FALSE AND expira > NOW() ORDER BY id DESC LIMIT 1',
+      [slug]
+    );
+    if (r.rows.length === 0) return res.status(400).json({ error: 'El código expiró o no existe. Pide uno nuevo.' });
+    const row = r.rows[0];
+    if (row.intentos >= 5) {
+      await pg.query('UPDATE cn_reset_codigos SET usado = TRUE WHERE id = $1', [row.id]);
+      return res.status(429).json({ error: 'Demasiados intentos con ese código. Pide uno nuevo.' });
+    }
+    if (!verifyPassword(codigo, row.codigo_hash)) {
+      await pg.query('UPDATE cn_reset_codigos SET intentos = intentos + 1 WHERE id = $1', [row.id]);
+      return res.status(401).json({ error: 'Código incorrecto' });
+    }
+    await pg.query('UPDATE cn_reset_codigos SET usado = TRUE WHERE id = $1', [row.id]);
+    await pg.query('UPDATE cn_novios SET password_hash = $1, updated_at = NOW() WHERE slug = $2', [hashPassword(nueva), slug]);
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
