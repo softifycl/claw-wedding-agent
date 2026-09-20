@@ -2986,7 +2986,7 @@ app.get('/api/codigonovios/admin/panel', requireAdminToken, async (req, res) => 
   try {
     const slug = (req.query.slug || '').toUpperCase().trim();
     if (!pg) return res.status(500).json({ error: 'Postgres no configurado' });
-    const r = await pg.query('SELECT id, slug, nombre_novio, nombre_novia, fecha_boda, telefono_novio, email, estado, activa_hasta, created_at FROM cn_novios WHERE slug = $1', [slug]);
+    const r = await pg.query('SELECT id, slug, nombre_novio, nombre_novia, fecha_boda, telefono_novio, email, banco, tipo_cuenta, numero_cuenta, rut_titular, estado, activa_hasta, created_at FROM cn_novios WHERE slug = $1', [slug]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Lista no encontrada' });
     const n = r.rows[0];
     const regalos = await pg.query('SELECT id, deseo_id, nombre_invitado, mensaje, monto_neto, comision, monto_total, mp_payment_id, estado, pagado_at, created_at FROM cn_regalos WHERE novio_id = $1 ORDER BY id DESC', [n.id]);
@@ -3054,8 +3054,13 @@ app.put('/api/codigonovios/admin/novios', requireAdminToken, async (req, res) =>
     const slug = (b.slug || '').toUpperCase().trim();
     if (!pg) return res.status(500).json({ error: 'Postgres no configurado' });
     await pg.query(
-      `UPDATE cn_novios SET nombre_novio=$1, nombre_novia=$2, fecha_boda=$3, telefono_novio=$4, email=$5, updated_at=NOW() WHERE slug=$6`,
-      [b.nombre_novio || null, b.nombre_novia || null, b.fecha_boda || null, b.telefono_novio || null, b.email || null, slug]
+      `UPDATE cn_novios SET nombre_novio=$1, nombre_novia=$2, fecha_boda=$3, telefono_novio=$4, email=$5,
+                           banco=$6, tipo_cuenta=$7, numero_cuenta=$8, rut_titular=$9, updated_at=NOW()
+       WHERE slug=$10`,
+      [b.nombre_novio || null, b.nombre_novia || null, b.fecha_boda || null, b.telefono_novio || null, b.email || null,
+       b.banco !== undefined ? b.banco : null, b.tipo_cuenta !== undefined ? b.tipo_cuenta : null,
+       b.numero_cuenta !== undefined ? b.numero_cuenta : null, b.rut_titular !== undefined ? b.rut_titular : null,
+       slug]
     );
     res.json({ ok: true });
   } catch (err) {
