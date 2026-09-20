@@ -2204,6 +2204,126 @@ app.use('/api/minisitio', (_req, res, next) => {
 });
 
 // GET /api/codigonovios/lista/:slug — lista pública (invitados)
+// ── Registro público de novios (crea la lista) ──
+const cnRegistroLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, limit: 10,
+  standardHeaders: 'draft-7', legacyHeaders: false,
+  keyGenerator: (req) => `reg:${req.ip}`,
+});
+
+function slugDesdeNombres(a, b) {
+  const limpiar = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toUpperCase().replace(/[^A-Z]/g, '');
+  const base = (limpiar(a).slice(0, 4) + limpiar(b).slice(0, 4));
+  return (base || 'NOVIOS').slice(0, 8);
+}
+
+async function sendWelcomeEmail(to, slug, nombre1, nombre2) {
+  const m = getMailer();
+  if (!m) throw new Error('mailer no configurado');
+  const pareja = [nombre1, nombre2].filter(Boolean).join(' & ');
+  const link = `${CN_SITE_URL}/n/${slug}`;
+  const subject = `Tu lista de regalos está lista — ${slug}`;
+  const text = [
+    `¡Hola ${pareja}!`,
+    '',
+    'Tu lista de regalos en Código Novios ya está creada.',
+    '',
+    `• Tu código: ${slug}`,
+    `• Link para compartir: ${link}`,
+    `• Tu panel (editar deseos, ver recaudación): ${CN_SITE_URL}/admin.php`,
+    '',
+    'Entra al panel con tu código + la contraseña que elegiste al registrarte.',
+    'El primer paso: crea tus deseos (viaje, luna de miel, aportes para la casa).',
+    '',
+    '— Código Novios',
+  ].join('\n');
+  const html = `
+    <div style="font-family:Georgia,'Times New Roman',serif;max-width:560px;margin:0 auto;color:#2b2b2b">
+      <h2 style="color:#8B3232;margin-bottom:4px">¡Tu lista está lista! 💍</h2>
+      <p>Hola ${pareja}, tu lista de regalos en Código Novios ya está creada.</p>
+      <table style="width:100%;border-collapse:collapse;margin:18px 0">
+        <tr><td style="padding:8px 0;border-bottom:1px solid #eee">Tu código</td><td style="text-align:right;font-weight:bold">${slug}</td></tr>
+        <tr><td style="padding:8px 0">Link para compartir</td><td style="text-align:right"><a href="${link}" style="color:#8B3232">${link}</a></td></tr>
+      </table>
+      <p>Entra a tu panel con tu código y la contraseña que elegiste:</p>
+      <p><a href="${CN_SITE_URL}/admin.php" style="color:#8B3232">Ir a mi panel</a></p>
+      <p style="color:#555">Primer paso: crea tus deseos (viaje, luna de miel, aportes para la casa).</p>
+      <p style="color:#999;font-size:12px;margin-top:24px">— Código Novios</p>
+    </div>`;
+  await m.sendMail({ from: CN_SMTP_FROM, to, replyTo: CN_SMTP_REPLY_TO, subject, text, html });
+}
+
+// POST /api/codigonovios/registro — crea una lista nueva (formulario público)
+app.post('/api/codigonovios/registro', cnRegistroLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const nombre1 = String(b.nombre_novio || '').trim();
+    const nombre2 = String(b.nombre_novia || '').trim();
+    const email = String(b.email || '').trim().toLowerCase();
+    const tel = String(b.telefono_novio || '').trim();
+    const fecha = String(b.fecha_boda || '').trim();
+    const pass = String(b.password || '');
+    const banco = String(b.banco || '').trim();
+    const tipoCuenta = String(b.tipo_cuenta || '').trim();
+    const numeroCuenta = String(b.numero_cuenta || '').trim();
+    const rutTitular = String(b.rut_titular || '').trim();
+
+    const faltan = [];
+    if (!nombre1) faltan.push('nombre del novio');
+    if (!nombre2) faltan.push('nombre de la novia');
+    if (!email) faltan.push('email');
+    if (!tel) faltan.push('teléfono');
+    if (!fecha) faltan.push('fecha de la boda');
+    if (!banco) faltan.push('banco');
+    if (!tipoCuenta) faltan.push('tipo de cuenta');
+    if (!numeroCuenta) faltan.push('número de cuenta');
+    if (!rutTitular) faltan.push('RUT del titular');
+    if (faltan.length) return res.status(400).json({ error: 'Faltan datos: ' + faltan.join(', ') });
+    if (!/^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$/.test(email)) return res.status(400).json({ error: 'Email inválido' });
+    if (pass.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return res.status(400).json({ error: 'Fecha de boda inválida (usa AAAA-MM-DD)' });
+    if (!pg) return res.status(500).json({ error: 'Postgres no configurado' });
+
+    const base = slugDesdeNombres(nombre1, nombre2);
+    let slug = base;
+    for (let i = 0; i < 12; i++) {
+      const ex = await pg.query('SELECT 1 FROM cn_novios WHERE slug = $1', [slug]);
+      if (ex.rows.length === 0) break;
+      slug = `${base.slice(0, 6)}${Math.floor(Math.random() * 90) + 10}`;
+    }
+
+    const ins = await pg.query(
+      `INSERT INTO cn_novios (slug, nombre_novio, nombre_novia, fecha_boda, telefono_novio, email,
+                              password_hash, banco, tipo_cuenta, numero_cuenta, titular, rut_titular,
+                              estado, activa_hasta)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'activa', ($4::date + 30))
+       RETURNING id, slug`,
+      [slug, nombre1, nombre2, fecha, tel, email, hashPassword(pass), banco, tipoCuenta, numeroCuenta,
+       [nombre1, nombre2].filter(Boolean).join(' & '), rutTitular]
+    );
+
+    let emailEnviado = true;
+    try {
+      await sendWelcomeEmail(email, slug, nombre1, nombre2);
+    } catch (e) {
+      emailEnviado = false;
+      console.error('📧 welcome email error:', e.message);
+    }
+
+    console.log(`💍 Registro nuevo: ${slug} (${email})`);
+    res.json({
+      ok: true,
+      slug,
+      link: `${CN_SITE_URL}/n/${slug}`,
+      panel: `${CN_SITE_URL}/admin.php`,
+      email_enviado: emailEnviado,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/codigonovios/lista/:slug', async (req, res) => {
   try {
     const slug = (req.params.slug || '').toUpperCase().trim();
