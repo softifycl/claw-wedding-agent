@@ -147,9 +147,11 @@ async function initPostgres() {
         monto_recaudado INT DEFAULT 0,
         estado TEXT DEFAULT 'activo',
         orden INT DEFAULT 0,
+        emoji TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `);
+    await pg.query('ALTER TABLE cn_deseos ADD COLUMN IF NOT EXISTS emoji TEXT');
     await pg.query(`
       CREATE TABLE IF NOT EXISTS cn_regalos (
         id SERIAL PRIMARY KEY,
@@ -2333,7 +2335,7 @@ app.get('/api/codigonovios/lista/:slug', async (req, res) => {
     const n = r.rows[0];
     if (n.estado === 'pausada') return res.status(403).json({ error: 'Lista pausada' });
     const deseos = await pg.query(
-      "SELECT id, nombre, descripcion, foto_url, precio_sugerido, monto_total, monto_recaudado FROM cn_deseos WHERE novio_id = $1 AND estado = 'activo' ORDER BY orden, id",
+      "SELECT id, nombre, descripcion, foto_url, emoji, precio_sugerido, monto_total, monto_recaudado FROM cn_deseos WHERE novio_id = $1 AND estado = 'activo' ORDER BY orden, id",
       [n.id]
     );
     const libres = await pg.query(
@@ -2990,7 +2992,7 @@ app.get('/api/codigonovios/admin/panel', requireAdminToken, async (req, res) => 
     if (r.rows.length === 0) return res.status(404).json({ error: 'Lista no encontrada' });
     const n = r.rows[0];
     const regalos = await pg.query('SELECT id, deseo_id, nombre_invitado, mensaje, monto_neto, comision, monto_total, mp_payment_id, estado, pagado_at, created_at FROM cn_regalos WHERE novio_id = $1 ORDER BY id DESC', [n.id]);
-    const deseos = await pg.query('SELECT id, nombre, descripcion, foto_url, precio_sugerido, monto_total, monto_recaudado, estado, orden FROM cn_deseos WHERE novio_id = $1 ORDER BY orden, id', [n.id]);
+    const deseos = await pg.query('SELECT id, nombre, descripcion, foto_url, emoji, precio_sugerido, monto_total, monto_recaudado, estado, orden FROM cn_deseos WHERE novio_id = $1 ORDER BY orden, id', [n.id]);
     const totalPagado = regalos.rows.filter(g => g.estado === 'pagado').reduce((s, g) => s + g.monto_neto, 0);
     const totalMeta = deseos.rows.reduce((s, d) => s + (d.monto_total || d.precio_sugerido || 0), 0);
     res.json({ novio: n, deseos: deseos.rows, regalos: regalos.rows, total_pagado: totalPagado, total_meta: totalMeta });
@@ -3014,8 +3016,8 @@ app.post('/api/codigonovios/admin/deseos', requireAdminToken, async (req, res) =
       const nombre = (b.nombre || '').trim();
       if (!nombre) return res.status(400).json({ error: 'nombre requerido' });
       const ins = await pg.query(
-        'INSERT INTO cn_deseos (novio_id, nombre, descripcion, foto_url, precio_sugerido, monto_total, orden) VALUES ($1,$2,$3,$4,$5,$6, COALESCE((SELECT MAX(orden)+1 FROM cn_deseos WHERE novio_id=$1),1)) RETURNING id',
-        [novioId, nombre, b.descripcion || null, b.foto_url || null, b.precio_sugerido || null, b.monto_total || null]
+        'INSERT INTO cn_deseos (novio_id, nombre, descripcion, foto_url, emoji, precio_sugerido, monto_total, orden) VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE((SELECT MAX(orden)+1 FROM cn_deseos WHERE novio_id=$1),1)) RETURNING id',
+        [novioId, nombre, b.descripcion || null, b.foto_url || null, b.emoji || null, b.precio_sugerido || null, b.monto_total || null]
       );
       return res.json({ ok: true, deseo_id: ins.rows[0].id });
     }
@@ -3027,8 +3029,8 @@ app.post('/api/codigonovios/admin/deseos', requireAdminToken, async (req, res) =
 
     if (accion === 'editar') {
       await pg.query(
-        'UPDATE cn_deseos SET nombre=$1, descripcion=$2, foto_url=$3, precio_sugerido=$4, monto_total=$5 WHERE id=$6',
-        [b.nombre || null, b.descripcion !== undefined ? b.descripcion : null, b.foto_url !== undefined ? b.foto_url : null, b.precio_sugerido || null, b.monto_total || null, deseoId]
+        'UPDATE cn_deseos SET nombre=$1, descripcion=$2, foto_url=$3, emoji=$4, precio_sugerido=$5, monto_total=$6 WHERE id=$7',
+        [b.nombre || null, b.descripcion !== undefined ? b.descripcion : null, b.foto_url !== undefined ? b.foto_url : null, b.emoji !== undefined ? b.emoji : null, b.precio_sugerido || null, b.monto_total || null, deseoId]
       );
       return res.json({ ok: true });
     }
